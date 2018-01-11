@@ -163,7 +163,9 @@ public:
     std::unique_ptr<swift::remoteAST::RemoteASTContext> m_remote_ast;
     SwiftLanguageRuntime *m_swift_runtime;
     swift::TypeBase *m_swift_type;
-    std::unordered_map<const char *, uint64_t> m_offsets;
+// [BEGIN GOOGLE] Change const char * -> std::string
+    std::unordered_map<std::string, uint64_t> m_offsets;
+// [END GOOGLE]
 
   public:
     llvm::Optional<uint64_t> ResolveOffset(ValueObject *valobj,
@@ -458,8 +460,10 @@ protected:
   typename KeyHasher<swift::ASTContext *, swift::TypeBase *,
                      MemberVariableOffsetResolverSP>::MapType m_resolvers_map;
 
-  std::unordered_map<const char *, lldb::SyntheticChildrenSP>
+// [BEGIN GOOGLE] Change const char * -> std::string
+  std::unordered_map<std::string, lldb::SyntheticChildrenSP>
       m_bridged_synthetics_map;
+// [END GOOGLE]
 
   CompilerType m_box_metadata_type;
 
