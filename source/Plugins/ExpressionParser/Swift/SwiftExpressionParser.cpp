@@ -470,6 +470,19 @@ public:
     ConstString name_const_str(NameStr);
     std::vector<swift::ValueDecl *> results;
 
+    bool shouldOutput = Name.getIdentifier().str().str() == "x" || Name.getIdentifier().str().str() == "thingy";
+
+    if (shouldOutput) {
+      llvm::dbgs() << "lookup additions " << Name.getIdentifier().str().str().c_str() << "\n";
+      llvm::dbgs() << "existing results are\n";
+      for (auto existing : RV) {
+        existing.getValueDecl()->dump(llvm::dbgs());
+      }
+      llvm::dbgs() << "end of existing results\n";
+      llvm::dbgs() << "lookup happening in:\n";
+      DC->dumpContext();
+    }
+
     // First look up the matching Decl's we've made in this compile, then pass
     // that list to the
     // persistent decls, which will only add decls it has that are NOT
@@ -478,80 +491,96 @@ public:
 
     m_staged_decls.FindMatchingDecls(name_const_str, results);
 
-    // Next look up persistent decls matching this name.  Then, if we are in the
-    // plain expression parser, and we
-    // aren't looking at a debugger variable, filter out persistent results of
-    // the same kind as one found by the
-    // ordinary lookup mechanism in the parser .  The problem
-    // we are addressing here is the case where the user has entered the REPL
-    // while in an ordinary debugging session
-    // to play around.  While there, e.g., they define a class that happens to
-    // have the same name as one in the
-    // program, then in some other context "expr" will call the class they've
-    // defined, not the one in the program
-    // itself would use.  Plain "expr" should behave as much like code in the
-    // program would, so we want to favor
-    // entities of the same DeclKind & name from the program over ones defined
-    // in the REPL.  For function decls we
-    // check the interface type and full name so we don't remove overloads that
-    // don't exist in the current scope.
+    // Next look up persistent decls matching this name.  Then, in two cases,
+    // filer out persistent results that are ambiguous with results found by the
+    // ordinary lookup mechanism in the parser.
+    //
+    // Case 1. We are in the plain expression parser, and we aren't looking at
+    // a debugger variable.  The problem we are addressing here is the case
+    // where the user has entered the REPL while in an ordinary debugging
+    // session to play around.  While there, e.g., they define a class that
+    // happens to have the same name as one in the program, then in some other
+    // context "expr" will call the class they've defined, not the one in the
+    // program itself would use.  Plain "expr" should behave as much like code
+    // in the program would, so we want to favor entities of the same DeclKind &
+    // name from the program over ones defined in the REPL.
+    //
+    // Case 2. The ordinary lookup mechanism found some decls defined in the
+    // current expression.  We filter out persistent results that are ambiguous
+    // with these so that the decl defined in the current expression always
+    // wins.
     //
     // Note also, we only do this for the persistent decls.  Anything in the
-    // "staged" list has been defined in this
-    // expr setting and so is more local than local.
+    // "staged" list has been defined in this expr setting and so is more local
+    // than local.
     if (m_persistent_vars) {
-      bool skip_results_with_matching_kind =
+      unsigned first_persistent_result_index = results.size();
+      m_persistent_vars->GetSwiftPersistentDecls(name_const_str, results);
+
+      if (shouldOutput) {
+        llvm::dbgs() << "CANDIDATE EXTRAS:\n";
+        for (auto result : results) {
+          result->dump(llvm::dbgs());
+        }
+        llvm::dbgs() << "END CANDIDATE EXTRAS\n";
+      }
+
+      // Case 1 filtering.
+      bool remove_all_ambiguous_results =
           !(m_parser.GetOptions().GetREPLEnabled() ||
             m_parser.GetOptions().GetPlaygroundTransformEnabled() ||
             (!NameStr.empty() && NameStr.front() == '$'));
 
-      size_t num_external_results = RV.size();
-      if (skip_results_with_matching_kind && num_external_results > 0) {
-        std::vector<swift::ValueDecl *> persistent_results;
-        m_persistent_vars->GetSwiftPersistentDecls(name_const_str,
-                                                   persistent_results);
-
-        size_t num_persistent_results = persistent_results.size();
-        for (size_t idx = 0; idx < num_persistent_results; idx++) {
-          swift::ValueDecl *value_decl = persistent_results[idx];
-          if (!value_decl)
-            continue;
-          swift::DeclName value_decl_name = value_decl->getFullName();
-          swift::DeclKind value_decl_kind = value_decl->getKind();
-          swift::CanType value_interface_type =
-              value_decl->getInterfaceType()->getCanonicalType();
-
-          bool is_function =
-              swift::isa<swift::AbstractFunctionDecl>(value_decl);
-
-          bool skip_it = false;
-          for (size_t rv_idx = 0; rv_idx < num_external_results; rv_idx++) {
-            if (swift::ValueDecl *rv_decl = RV[rv_idx].getValueDecl()) {
-              if (value_decl_kind == rv_decl->getKind()) {
-                if (is_function) {
-                  swift::DeclName rv_full_name = rv_decl->getFullName();
-                  if (rv_full_name.matchesRef(value_decl_name)) {
-                    // If the full names match, make sure the interface types
-                    // match:
-                    if (rv_decl->getInterfaceType()->getCanonicalType() ==
-                        value_interface_type)
-                      skip_it = true;
-                  }
-                } else {
-                  skip_it = true;
-                }
-
-                if (skip_it)
-                  break;
-              }
-            }
-          }
-          if (!skip_it)
-            results.push_back(value_decl);
+      if (remove_all_ambiguous_results && !RV.empty()) {
+        if (shouldOutput) {
+          llvm::dbgs() << "removing all ambiguous results\n";
         }
-      } else {
-        m_persistent_vars->GetSwiftPersistentDecls(name_const_str, results);
+        results.erase(std::remove_if(results.begin() + first_persistent_result_index,
+                       results.end(),
+                       [&](swift::ValueDecl *value_decl) -> bool {
+                         return AmbiguousWithExistingLookupResults(value_decl,
+                                                                   RV);
+                       }),
+                      results.end());
       }
+
+      // Case 2 filtering.
+      llvm::SmallVector<swift::LookupResultEntry, 4> decls_from_current_expr;
+      std::copy_if(RV.begin(),
+                   RV.end(),
+                   std::back_inserter(decls_from_current_expr),
+                   [&](swift::LookupResultEntry existing_result) -> bool {
+                     if (shouldOutput) {
+                       llvm::dbgs() << "existing result decl context\n";
+                       existing_result.getValueDecl()->getDeclContext()->dumpContext();
+                     }
+                     auto existing_result_decl_context = existing_result.getValueDecl()->getDeclContext();
+                     return existing_result_decl_context->isChildContextOf(DC) || existing_result_decl_context == DC;
+                   });
+      if (!decls_from_current_expr.empty()) {
+        if (shouldOutput) {
+          llvm::dbgs() << "removing ambiguous results from current expr\n";
+        }
+        results.erase(std::remove_if(results.begin() + first_persistent_result_index,
+                       results.end(),
+                       [&](swift::ValueDecl *value_decl) -> bool {
+                         auto foo = AmbiguousWithExistingLookupResults(
+                             value_decl, decls_from_current_expr);
+                         if (shouldOutput) {
+                           llvm::dbgs() << "checking result " << foo << "\n";
+                           value_decl->dump(llvm::dbgs());
+                         }
+                         return foo;
+                       }), results.end());
+      }
+    }
+
+    if (shouldOutput) {
+      llvm::dbgs() << "FINAL EXTRAS:\n";
+      for (auto result : results) {
+        result->dump(llvm::dbgs());
+      }
+      llvm::dbgs() << "END FINAL EXTRAS\n";
     }
 
     for (size_t idx = 0; idx < results.size(); idx++) {
@@ -614,6 +643,42 @@ private:
       m_staged_decls; // We stage the decls we are globalize in this map.
   // They will get copied over to the SwiftPersistentVariable
   // store if the parse succeeds.
+
+  /// Tests if new_lookup_result is ambiguous with any of the existing_results.
+  /// The test mostly just checks if the kinds match, but for function decls we
+  /// check the interface type and full name.
+  bool AmbiguousWithExistingLookupResults(const swift::ValueDecl *new_lookup_result, const ResultVector &existing_results) {
+    if (!new_lookup_result)
+      return false;
+
+    swift::DeclName new_lookup_result_name = new_lookup_result->getFullName();
+    swift::DeclKind new_lookup_result_kind = new_lookup_result->getKind();
+    swift::CanType value_interface_type =
+        new_lookup_result->getInterfaceType()->getCanonicalType();
+
+    bool is_function =
+        swift::isa<swift::AbstractFunctionDecl>(new_lookup_result);
+
+    for (auto existing_result : existing_results) {
+      if (swift::ValueDecl *existing_result_decl = existing_result.getValueDecl()) {
+        if (new_lookup_result_kind == existing_result_decl->getKind()) {
+          if (is_function) {
+            swift::DeclName existing_result_full_name = existing_result_decl->getFullName();
+            if (existing_result_full_name.matchesRef(new_lookup_result_name)) {
+              // If the full names match, make sure the interface types
+              // match:
+              if (existing_result_decl->getInterfaceType()->getCanonicalType() ==
+                  value_interface_type)
+                return true;
+            }
+          } else {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
 };
 } // END Anonymous namespace
 
@@ -1659,8 +1724,10 @@ unsigned SwiftExpressionParser::Parse(DiagnosticManager &diagnostic_manager,
   swift::TopLevelContext top_level_context;
   swift::OptionSet<swift::TypeCheckingFlags> type_checking_options;
 
+  llvm::dbgs() << "I am performing type checking\n";
   swift::performTypeChecking(parsed_expr->source_file, top_level_context,
                              type_checking_options);
+  llvm::dbgs() << "I have finished performing type checking\n";
 
   if (m_swift_ast_context->HasErrors()) {
     DiagnoseSwiftASTContextError();
